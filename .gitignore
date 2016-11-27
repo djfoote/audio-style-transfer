@@ -1,0 +1,4 @@
+vae/MNIST/*
+vae/checkpoint/*
+*.pyc
+.DS_Store

@@ -1,6 +1,11 @@
+from __future__ import absolute_import
+from __future__ import division
+from __future__ import print_function
+
 import tensorflow as tf
 import numpy as np
 import matplotlib.pyplot as plt
+import scipy.special as sps
 
 import argparse
 
@@ -17,6 +22,7 @@ def get_args():
 
 
 def mnist_postprocessor(image):
+    image = sps.expit(image)
     num_samples, _ = image.shape
     num_rows = int(np.floor(np.sqrt(num_samples)))
     images = image.reshape(num_samples, 28, 28)
@@ -51,9 +57,10 @@ def generate_mnist(filepath, latent_dim=2, enc_args={}, dec_args={}):
 
 if __name__ == '__main__':
     args = get_args()
+    enc_args, dec_args = {"hidden_sizes": (400,)}, {"hidden_sizes": (400,)}
     if args.mode == "train":
-        train_mnist(args.filepath, n_itr=args.n_itr)
+        train_mnist(args.filepath, n_itr=args.n_itr, latent_dim=20, enc_args=enc_args, dec_args=dec_args)
     elif args.mode == "generate":
-        generate_mnist(args.filepath)
+        generate_mnist(args.filepath, latent_dim=20, enc_args=enc_args, dec_args=dec_args)
     else:
         raise NotImplementedError

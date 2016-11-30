@@ -1,13 +1,17 @@
+from __future__ import absolute_import
+from __future__ import division
+from __future__ import print_function
+
 import tensorflow as tf
 
 
 def weight_variable(shape, name):
-    initial = tf.truncated_normal(shape, stddev=0.1)
+    initial = tf.truncated_normal(shape, stddev=0.001)
     return tf.Variable(initial, name=name)
 
 
 def bias_variable(shape, name):
-    initial = tf.constant(0.1, shape=shape)
+    initial = tf.constant(0., shape=shape)
     return tf.Variable(initial, name=name)
 
 
@@ -22,8 +26,8 @@ class ParameterizedDistribution:
 class ParameterizedGaussian(ParameterizedDistribution):
     def distribution(self, x):
         mu, logvar = self.mu_and_logvar(x)
-        diag_std_vector = tf.tile(logvar_conditional, [self.input_dim])
-        return tf.contrib.distributions.MultivariateNormalDiag(mu_conditional, diag_std_vector)
+        std = tf.exp(0.5 * logvar)
+        return tf.contrib.distributions.MultivariateNormalDiag(mu, std)
 
     def mu_and_logvar(self, x):
         raise NotImplementedError
@@ -36,11 +40,13 @@ class MLP:
                  name,
                  hidden_sizes=(20,),
                  nonlinearity=tf.nn.relu,
+                 activate_output=False,
     ):
         self.input_dim = input_dim      
         self.output_dim = output_dim
         self.hidden_sizes = hidden_sizes
         self.nonlinearity = nonlinearity
+        self.activate_output = activate_output
 
         with tf.variable_scope(name):
             self.weights = []
@@ -54,8 +60,13 @@ class MLP:
 
     def fn(self, x):
         self.layers = [x]
-        for weight, bias in zip(self.weights, self.biases):
-            self.layers.append(tf.matmul(self.layers[-1], weight) + bias)
+        for i, (weight, bias) in enumerate(zip(self.weights, self.biases)):
+            pre_activation = tf.matmul(self.layers[-1], weight) + bias
+            if i == len(self.weights) - 1 and not self.activate_output:
+                layer = pre_activation
+            else:
+                layer = self.nonlinearity(pre_activation)
+            self.layers.append(layer)
         return self.layers[-1]
 
     def regularization_loss(self, reg_fn):
@@ -65,27 +76,28 @@ class MLP:
 class GaussianMLP(ParameterizedGaussian):
     def __init__(self,
                  input_dim,
-                 mu_output_dim,
+                 output_dim,
                  name,
                  hidden_sizes=(20,),
                  nonlinearity=tf.nn.relu,
     ):
-        self.input_dim = input_dim      
-        self.mu_output_dim = mu_output_dim
+        self.input_dim = input_dim
+        self.output_dim = output_dim
         self.final_hidden_dim = hidden_sizes[-1]
 
         with tf.variable_scope(name):
             self.network = MLP(input_dim=input_dim,
                                output_dim=self.final_hidden_dim,
-                               name="hidden",
+                               name="network",
                                hidden_sizes=hidden_sizes[:-1],
                                nonlinearity=nonlinearity,
+                               activate_output=True,
             )
 
-            self.mu_weight = weight_variable([self.final_hidden_dim, self.mu_output_dim], name="W_mu")
-            self.mu_bias = bias_variable([self.mu_output_dim], name="b_mu")
-            self.logvar_weight = weight_variable([self.final_hidden_dim, 1], name="W_logvar")
-            self.logvar_bias = bias_variable([1], name="b_logvar")
+            self.logvar_weight = weight_variable([self.final_hidden_dim, self.output_dim], name="W_logvar")
+            self.logvar_bias = bias_variable([self.output_dim], name="b_logvar")
+            self.mu_weight = weight_variable([self.final_hidden_dim, self.output_dim], name="W_mu")
+            self.mu_bias = bias_variable([self.output_dim], name="b_mu")
 
     def mu_and_logvar(self, x):
         final_hidden = self.network.fn(x)
@@ -114,7 +126,7 @@ class BernoulliMLP(ParameterizedDistribution):
 class GaussianVAE:
     """
     Variational Autoencoder in which the prior is an (unparameterized) centered isotropic Gaussian and
-    the approximate posterior (encoder) is parameterized as a multivariate Gaussian with scaled isotropic
+    the approximate posterior (encoder) is parameterized as a multivariate Gaussian with diagonal
     covariance. The conditional distribution is any parameterized distribution.
 
     Concretely, self.encoder is a ParameterizedGaussian object and self.decoder is a ParameterizedDistribution
@@ -144,18 +156,21 @@ class GaussianVAE:
               filepath,
               batch_size=100,
               n_itr=int(1e6),
-              learning_rate=1e-3,
+              learning_rate=0.01,
               print_every=100,
     ):
         x = tf.placeholder(tf.float32, shape=[None, self.input_dim])
 
         mu_latent, logvar_latent = self.encoder.mu_and_logvar(x)
-        kl_div = -0.5 * tf.reduce_sum(1 + logvar_latent - tf.square(mu_latent) - tf.exp(logvar_latent))
+        kl_div = -0.5 * tf.reduce_sum(1 + logvar_latent - tf.square(mu_latent) - tf.exp(logvar_latent), reduction_indices=1)
 
-        epsilon = tf.random_normal([self.latent_dim])
+        epsilon = tf.random_normal(tf.shape(mu_latent))
         latent_code = mu_latent + epsilon * tf.exp(0.5 * logvar_latent)
 
-        evidence = self.decoder.distribution(latent_code).log_prob(x)
+        evidence = tf.reduce_sum(self.decoder.distribution(latent_code).log_prob(x), reduction_indices=1)
+        x_hat = self.decoder.network.fn(latent_code)
+        BCE = tf.reduce_sum(tf.nn.sigmoid_cross_entropy_with_logits(x_hat, x), reduction_indices=1)
+        evidence = -BCE
 
         lower_bound = tf.reduce_mean(-kl_div + evidence)
         loss = -lower_bound
@@ -170,7 +185,6 @@ class GaussianVAE:
             sess.run(tf.initialize_all_variables())
 
             for itr in range(1, n_itr+1):
-                # import pdb; pdb.set_trace()
                 batch, _ = train_data_queue.next_batch(batch_size)
                 _, curr_loss = sess.run([train_step, loss], feed_dict={x: batch})
 

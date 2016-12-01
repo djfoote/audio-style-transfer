@@ -5,12 +5,12 @@ from __future__ import print_function
 import tensorflow as tf
 
 
-def weight_variable(shape, name):
+def weight_variable(shape, name=None):
     initial = tf.truncated_normal(shape, stddev=0.001)
     return tf.Variable(initial, name=name)
 
 
-def bias_variable(shape, name):
+def bias_variable(shape, name=None):
     initial = tf.constant(0., shape=shape)
     return tf.Variable(initial, name=name)
 
@@ -24,74 +24,85 @@ class ParameterizedDistribution:
 
 
 class ParameterizedGaussian(ParameterizedDistribution):
+    def __init__(self, name=None):
+        self.name = name
+
     def distribution(self, x):
-        mu, logvar = self.mu_and_logvar(x)
-        std = tf.exp(0.5 * logvar)
-        return tf.contrib.distributions.MultivariateNormalDiag(mu, std)
+        with tf.name_scope(self.name):
+            mu, logvar = self.mu_and_logvar(x)
+            std = tf.exp(0.5 * logvar)
+            return tf.contrib.distributions.MultivariateNormalDiag(mu, std)
 
     def mu_and_logvar(self, x):
         raise NotImplementedError
 
 
 class MLP:
+    """
+    Assumes rank 2 input where first axis is batch.
+    """
     def __init__(self,
                  input_dim,
                  output_dim,
-                 name,
                  hidden_sizes=(20,),
-                 nonlinearity=tf.nn.relu,
-                 activate_output=False,
+                 hidden_nonlinearity=tf.nn.relu,
+                 output_nonlinearity=None,
+                 name=None,
     ):
-        self.input_dim = input_dim      
+        self.input_dim = input_dim
         self.output_dim = output_dim
         self.hidden_sizes = hidden_sizes
-        self.nonlinearity = nonlinearity
-        self.activate_output = activate_output
+        self.hidden_nonlinearity = hidden_nonlinearity
+        self.output_nonlinearity = output_nonlinearity if output_nonlinearity is not None else lambda z: z
+        self.name = name
 
-        with tf.variable_scope(name):
+        with tf.variable_scope(self.name + "_init"):
             self.weights = []
             self.biases = []
             self.sizes = list(self.hidden_sizes) + [self.output_dim]
             dim = self.input_dim
             for i, z_dim in enumerate(self.sizes):
-                self.weights.append(weight_variable([dim, z_dim], name="W{}".format(i)))
-                self.biases.append(bias_variable([z_dim], name="b{}".format(i)))
-                dim = z_dim
+                with tf.variable_scope("layer{}_init".format(i)):
+                    self.weights.append(weight_variable([dim, z_dim], name="W{}".format(i)))
+                    self.biases.append(bias_variable([z_dim], name="b{}".format(i)))
+                    dim = z_dim
 
     def fn(self, x):
-        self.layers = [x]
-        for i, (weight, bias) in enumerate(zip(self.weights, self.biases)):
-            pre_activation = tf.matmul(self.layers[-1], weight) + bias
-            if i == len(self.weights) - 1 and not self.activate_output:
-                layer = pre_activation
-            else:
-                layer = self.nonlinearity(pre_activation)
-            self.layers.append(layer)
-        return self.layers[-1]
+        with tf.name_scope(self.name):
+            self.layers = [x]
+            for i, (weight, bias) in enumerate(zip(self.weights, self.biases)):
+                with tf.name_scope("layer{}".format(i)):
+                    pre_activation = tf.matmul(self.layers[-1], weight) + bias
+                    nonlinearity = self.hidden_nonlinearity if i < len(self.weights) - 1 else self.output_nonlinearity
+                    self.layers.append(nonlinearity(pre_activation))
+            return self.layers[-1]
 
     def regularization_loss(self, reg_fn):
-        return sum([reg_fn(weight) for weight in self.weights])
+        with tf.name_scope(self.name):
+            with tf.name_scope("regularization"):
+                return sum([reg_fn(weight) for weight in self.weights])
 
 
 class GaussianMLP(ParameterizedGaussian):
     def __init__(self,
                  input_dim,
                  output_dim,
-                 name,
                  hidden_sizes=(20,),
                  nonlinearity=tf.nn.relu,
+                 name=None,
     ):
         self.input_dim = input_dim
         self.output_dim = output_dim
         self.final_hidden_dim = hidden_sizes[-1]
+        self.name = name
 
-        with tf.variable_scope(name):
+        with tf.variable_scope(self.name + "_init"):
             self.network = MLP(input_dim=input_dim,
                                output_dim=self.final_hidden_dim,
-                               name="network",
                                hidden_sizes=hidden_sizes[:-1],
-                               nonlinearity=nonlinearity,
-                               activate_output=True,
+                               hidden_nonlinearity=nonlinearity,
+                               output_nonlinearity=nonlinearity,
+                               name="hidden_network",
             )
 
             self.logvar_weight = weight_variable([self.final_hidden_dim, self.output_dim], name="W_logvar")
@@ -99,28 +110,51 @@ class GaussianMLP(ParameterizedGaussian):
             self.mu_weight = weight_variable([self.final_hidden_dim, self.output_dim], name="W_mu")
             self.mu_bias = bias_variable([self.output_dim], name="b_mu")
 
-    def mu_and_logvar(self, x):
-        final_hidden = self.network.fn(x)
+    def mu_and_logvar(self, x, name=None):
+        with tf.name_scope(name):
+            with tf.name_scope(self.name):
+                final_hidden = self.network.fn(x)
 
-        mu = tf.matmul(final_hidden, self.mu_weight) + self.mu_bias
-        logvar = tf.matmul(final_hidden, self.logvar_weight) + self.logvar_bias
-        return mu, logvar
+                with tf.name_scope('mu'):
+                    mu = tf.matmul(final_hidden, self.mu_weight) + self.mu_bias
+                with tf.name_scope('logvar'):
+                    logvar = tf.matmul(final_hidden, self.logvar_weight) + self.logvar_bias
+                return mu, logvar
 
     def regularization_loss(self, reg_fn):
-        return self.network.regularization_loss(reg_fn) + reg_fn(self.mu_weight) + reg_fn(self.logvar_weight)
+        with tf.name_scope(self.name):
+            return self.network.regularization_loss(reg_fn) + reg_fn(self.mu_weight) + reg_fn(self.logvar_weight)
 
 
 class BernoulliMLP(ParameterizedDistribution):
-    def __init__(self, input_dim, output_dim, name, hidden_sizes=(20,), nonlinearity=tf.nn.relu):
-        with tf.variable_scope(name):
-            self.network = MLP(input_dim, output_dim, "network", hidden_sizes, nonlinearity)
+    def __init__(self,
+                 input_dim,
+                 output_dim,
+                 hidden_sizes=(20,),
+                 hidden_nonlinearity=tf.nn.relu,
+                 name=None,
+    ):
+        self.name = name
 
-    def distribution(self, x):
-        logits = self.network.fn(x)
-        return tf.contrib.distributions.Bernoulli(logits=logits)
+        with tf.variable_scope(self.name + "_init"):
+            self.network = MLP(
+                input_dim=input_dim,
+                output_dim=output_dim,
+                hidden_sizes=hidden_sizes,
+                hidden_nonlinearity=hidden_nonlinearity,
+                name="network",
+            )
+
+    def distribution(self, x, name=None):
+        with tf.name_scope(name):
+            with tf.name_scope(self.name):
+                logits = self.network.fn(x)
+                return tf.contrib.distributions.Bernoulli(logits=logits)
 
     def regularization_loss(self, reg_fn):
-        return self.network.regularization_loss(reg_fn)
+        with tf.name_scope(self.name):
+            with tf.name_scope("regularization"):
+                return self.network.regularization_loss(reg_fn)
 
 
 class GaussianVAE:
@@ -159,27 +193,35 @@ class GaussianVAE:
               learning_rate=0.01,
               print_every=100,
     ):
-        x = tf.placeholder(tf.float32, shape=[None, self.input_dim])
+        x = tf.placeholder(tf.float32, shape=[None, self.input_dim], name="x")
 
         mu_latent, logvar_latent = self.encoder.mu_and_logvar(x)
-        kl_div = -0.5 * tf.reduce_sum(1 + logvar_latent - tf.square(mu_latent) - tf.exp(logvar_latent), reduction_indices=1)
 
-        epsilon = tf.random_normal(tf.shape(mu_latent))
-        latent_code = mu_latent + epsilon * tf.exp(0.5 * logvar_latent)
+        with tf.name_scope("kld"):
+            kl_div = -0.5 * tf.reduce_sum(1 + logvar_latent - tf.square(mu_latent) - tf.exp(logvar_latent), reduction_indices=1)
 
-        evidence = tf.reduce_sum(self.decoder.distribution(latent_code).log_prob(x), reduction_indices=1)
-        x_hat = self.decoder.network.fn(latent_code)
-        BCE = tf.reduce_sum(tf.nn.sigmoid_cross_entropy_with_logits(x_hat, x), reduction_indices=1)
-        evidence = -BCE
+        with tf.name_scope("epsilon"):
+            epsilon = tf.random_normal(tf.shape(mu_latent))
 
-        lower_bound = tf.reduce_mean(-kl_div + evidence)
-        loss = -lower_bound
-        regularized_loss = loss \
-            + self.encoder.regularization_loss(self.reg_fn) \
-            + self.decoder.regularization_loss(self.reg_fn)
+        with tf.name_scope("latent_code"):
+            with tf.name_scope("std"):
+                std = tf.exp(0.5 * logvar_latent)
+            latent_code = mu_latent + epsilon * std
+
+        evidence = tf.reduce_sum(self.decoder.distribution(latent_code).log_prob(x), reduction_indices=1, name="evidence")
+
+        with tf.name_scope("loss"):
+            lower_bound = tf.reduce_mean(-kl_div + evidence, name="lower_bound")
+            loss = -lower_bound 
+            regularized_loss = loss \
+                + self.encoder.regularization_loss(self.reg_fn) \
+                + self.decoder.regularization_loss(self.reg_fn)
         train_step = tf.train.AdamOptimizer(learning_rate).minimize(regularized_loss)
 
         saver = tf.train.Saver()
+
+        writer = tf.train.SummaryWriter(filepath.split('/')[0])
+        writer.add_graph(tf.get_default_graph())
 
         with tf.Session() as sess:
             sess.run(tf.initialize_all_variables())

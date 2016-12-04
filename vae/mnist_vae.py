@@ -15,8 +15,10 @@ from vae import GaussianMLP, BernoulliMLP, GaussianVAE
 def get_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("mode", type=str)
-    parser.add_argument("--filepath", "-f", type=str, default='checkpoint/mnist.ckpt')
+    parser.add_argument("--logdir", "-l", type=str, default="mnist_log")
     parser.add_argument("--n-itr", "-n", type=int, default=int(1e6))
+    parser.add_argument("--latent-dim", "-d", type=int, default=20)
+    parser.add_argument("--num-samples", "-s", type=int, default=16)
     args = parser.parse_args()
     return args
 
@@ -33,34 +35,43 @@ def mnist_postprocessor(image):
     plt.show()
 
 
-def mnist_vae(latent_dim=2, enc_args={}, dec_args={}):
+def mnist_vae(logdir, latent_dim, enc_args, dec_args):
     return GaussianVAE(
         input_dim=784,
         latent_dim=latent_dim,
+        logdir=logdir,
         encoder=GaussianMLP(784, latent_dim, name="encoder", **enc_args),
         decoder=BernoulliMLP(latent_dim, 784, name="decoder", **dec_args),
         postprocessor=mnist_postprocessor,
     )
 
 
-def train_mnist(filepath, n_itr=int(1e6), latent_dim=2, enc_args={}, dec_args={}):
+def train_mnist(logdir, n_itr, latent_dim, enc_args, dec_args):
     from tensorflow.examples.tutorials.mnist import input_data
     mnist = input_data.read_data_sets('MNIST')
-    vae = mnist_vae(latent_dim, enc_args, dec_args)
-    vae.train(mnist.train, filepath=filepath, n_itr=n_itr)
+    vae = mnist_vae(logdir, latent_dim, enc_args, dec_args)
+    vae.train(mnist.train, n_itr=n_itr)
 
 
-def generate_mnist(filepath, latent_dim=2, enc_args={}, dec_args={}):
-    vae = mnist_vae(latent_dim, enc_args, dec_args)
-    vae.generate(num_samples=16, filepath=filepath, use_logits=True)
+def generate_mnist(logdir, num_samples, latent_dim, enc_args, dec_args):
+    vae = mnist_vae(logdir, latent_dim, enc_args, dec_args)
+    vae.generate(num_samples=num_samples, use_logits=True)
 
 
 if __name__ == '__main__':
     args = get_args()
-    enc_args, dec_args = {"hidden_sizes": (400,)}, {"hidden_sizes": (400,)}
+    vae_kwargs = {
+        "latent_dim": args.latent_dim,
+        "enc_args": {
+            "hidden_sizes": (400,),
+        },
+        "dec_args": {
+            "hidden_sizes": (400,),
+        },
+    }
     if args.mode == "train":
-        train_mnist(args.filepath, n_itr=args.n_itr, latent_dim=20, enc_args=enc_args, dec_args=dec_args)
+        train_mnist(logdir=args.logdir, n_itr=args.n_itr, **vae_kwargs)
     elif args.mode == "generate":
-        generate_mnist(args.filepath, latent_dim=20, enc_args=enc_args, dec_args=dec_args)
+        generate_mnist(logdir=args.logdir, num_samples=args.num_samples, **vae_kwargs)
     else:
         raise NotImplementedError

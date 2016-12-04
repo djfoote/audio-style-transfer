@@ -1,4 +1,6 @@
 vae/MNIST/*
+vae/mnist_log/*
+vae/logdir/*
 vae/checkpoint/*
 *.pyc
 .DS_Store

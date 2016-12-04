@@ -169,6 +169,7 @@ class GaussianVAE:
     def __init__(self,
                  input_dim,
                  latent_dim,
+                 logdir,
                  encoder=None,
                  decoder=None,
                  reg_fn=None,
@@ -176,6 +177,7 @@ class GaussianVAE:
     ):
         self.input_dim = input_dim
         self.latent_dim = latent_dim
+        self.logdir = logdir
         self.encoder = encoder
         self.decoder = decoder
         self.reg_fn = reg_fn if reg_fn is not None else lambda _: 0
@@ -184,18 +186,11 @@ class GaussianVAE:
             self.encoder = GaussianMLP(input_dim, latent_dim)
         if self.decoder is None:
             self.decoder = BernoulliMLP(latent_dim, input_dim)
+        self.initialize_model()
 
-    def train(self,
-              train_data_queue,
-              filepath,
-              batch_size=100,
-              n_itr=int(1e6),
-              learning_rate=0.01,
-              print_every=100,
-    ):
-        x = tf.placeholder(tf.float32, shape=[None, self.input_dim], name="x")
-
-        mu_latent, logvar_latent = self.encoder.mu_and_logvar(x)
+    def initialize_model(self):
+        self.x = tf.placeholder(tf.float32, shape=[None, self.input_dim], name="x")
+        mu_latent, logvar_latent = self.encoder.mu_and_logvar(self.x)
 
         with tf.name_scope("kld"):
             kl_div = -0.5 * tf.reduce_sum(1 + logvar_latent - tf.square(mu_latent) - tf.exp(logvar_latent), reduction_indices=1)
@@ -208,33 +203,44 @@ class GaussianVAE:
                 std = tf.exp(0.5 * logvar_latent)
             latent_code = mu_latent + epsilon * std
 
-        evidence = tf.reduce_sum(self.decoder.distribution(latent_code).log_prob(x), reduction_indices=1, name="evidence")
+        evidence = tf.reduce_sum(self.decoder.distribution(latent_code).log_prob(self.x), reduction_indices=1, name="evidence")
 
         with tf.name_scope("loss"):
             lower_bound = tf.reduce_mean(-kl_div + evidence, name="lower_bound")
             loss = -lower_bound 
-            regularized_loss = loss \
-                + self.encoder.regularization_loss(self.reg_fn) \
-                + self.decoder.regularization_loss(self.reg_fn)
-        train_step = tf.train.AdamOptimizer(learning_rate).minimize(regularized_loss)
+            with tf.name_scope("regularized_loss"):
+                self.regularized_loss = loss \
+                    + self.encoder.regularization_loss(self.reg_fn) \
+                    + self.decoder.regularization_loss(self.reg_fn)
 
-        saver = tf.train.Saver()
+        self.saver = tf.train.Saver()
 
-        writer = tf.train.SummaryWriter(filepath.split('/')[0])
+        writer = tf.train.SummaryWriter(self.logdir)
         writer.add_graph(tf.get_default_graph())
 
+    def train(self,
+              train_data_queue,
+              checkpoint="model.ckpt",
+              batch_size=100,
+              n_itr=int(1e6),
+              learning_rate=0.01,
+              print_every=100,
+    ):
+        train_step = tf.train.AdamOptimizer(learning_rate).minimize(self.regularized_loss)
+        checkpoint_path = self.logdir + "/" + checkpoint
         with tf.Session() as sess:
             sess.run(tf.initialize_all_variables())
 
             for itr in range(1, n_itr+1):
                 batch, _ = train_data_queue.next_batch(batch_size)
-                _, curr_loss = sess.run([train_step, loss], feed_dict={x: batch})
+                _, curr_loss = sess.run([train_step, self.regularized_loss], feed_dict={self.x: batch})
 
                 if itr % print_every == 0:
-                    saver.save(sess, filepath)
+                    self.saver.save(sess, checkpoint_path)
                     print("Itr {} : Loss = {}".format(itr, curr_loss))
 
-    def generate(self, filepath, num_samples=1, use_logits=False):
+    def generate(self, checkpoint="model.ckpt", num_samples=1, use_logits=False):
+        checkpoint_path = self.logdir + "/" + checkpoint
         epsilon = tf.random_normal([num_samples, self.latent_dim])
         if use_logits:
             sample = self.decoder.distribution(epsilon).logits
@@ -242,8 +248,7 @@ class GaussianVAE:
             sample = self.decoder.distribution(epsilon).sample()
 
         with tf.Session() as sess:
-            saver = tf.train.Saver()
-            saver.restore(sess, filepath)
+            self.saver.restore(sess, checkpoint_path)
 
             sample_output = sess.run(sample)
             self.postprocessor(sample_output)

@@ -7,7 +7,7 @@ import tensorflow as tf
 from vae import weight_variable, bias_variable
 
 
-class Distribution:
+class Distribution(object):
 	def log_prob(self, x):
 		raise NotImplementedError
 
@@ -66,9 +66,9 @@ class SimpleSMM(SemiMarkovModel):
 class LinearCategoricalSMM(SimpleSMM):
 	def __init__(self, lookback, num_categories, pad=False):
 		self.num_categories = num_categories
-		super().__init__(self, lookback, pad)
+		super(LinearCategoricalSMM, self).__init__(lookback)
 
-	def conditional_logits_from_prev_i(self, i):
+	def conditional_from_prev_i(self, i):
 		W = weight_variable(shape=(i, self.num_categories))
-		b = bias_variable(shape=(self.num_categories))
+		b = bias_variable(shape=(self.num_categories,))
 		return lambda prev_i: tf.contrib.distributions.Categorical(tf.matmul(prev_i, W) + b)

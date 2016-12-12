@@ -15,15 +15,18 @@ def bias_variable(shape, name=None):
     return tf.Variable(initial, name=name)
 
 
-class ParameterizedDistribution:
-    def distribution(self, input):
+class ConditionalDistribution:
+    def distribution(self, z):
         raise NotImplementedError
 
-    def regularization_loss(self, reg_fn):
-        raise NotImplementedError
+    def log_prob(self, x, z):
+        return self.distribution(z).log_prob(x)
+
+    def sample(self, z):
+        return self.distribution(z).sample()
 
 
-class ParameterizedGaussian(ParameterizedDistribution):
+class ParameterizedGaussian(ConditionalDistribution):
     def __init__(self, name=None):
         self.name = name
 
@@ -77,11 +80,6 @@ class MLP:
                     self.layers.append(nonlinearity(pre_activation))
             return self.layers[-1]
 
-    def regularization_loss(self, reg_fn):
-        with tf.name_scope(self.name):
-            with tf.name_scope("regularization"):
-                return sum([reg_fn(weight) for weight in self.weights])
-
 
 class GaussianMLP(ParameterizedGaussian):
     def __init__(self,
@@ -121,12 +119,8 @@ class GaussianMLP(ParameterizedGaussian):
                     logvar = tf.matmul(final_hidden, self.logvar_weight) + self.logvar_bias
                 return mu, logvar
 
-    def regularization_loss(self, reg_fn):
-        with tf.name_scope(self.name):
-            return self.network.regularization_loss(reg_fn) + reg_fn(self.mu_weight) + reg_fn(self.logvar_weight)
 
-
-class BernoulliMLP(ParameterizedDistribution):
+class BernoulliMLP(ConditionalDistribution):
     def __init__(self,
                  input_dim,
                  output_dim,
@@ -151,11 +145,6 @@ class BernoulliMLP(ParameterizedDistribution):
                 logits = self.network.fn(x)
                 return tf.contrib.distributions.Bernoulli(logits=logits)
 
-    def regularization_loss(self, reg_fn):
-        with tf.name_scope(self.name):
-            with tf.name_scope("regularization"):
-                return self.network.regularization_loss(reg_fn)
-
 
 class GaussianVAE:
     """
@@ -163,7 +152,7 @@ class GaussianVAE:
     the approximate posterior (encoder) is parameterized as a multivariate Gaussian with diagonal
     covariance. The conditional distribution is any parameterized distribution.
 
-    Concretely, self.encoder is a ParameterizedGaussian object and self.decoder is a ParameterizedDistribution
+    Concretely, self.encoder is a ParameterizedGaussian object and self.decoder is a ConditionalDistribution
     object.
     """
     def __init__(self,
@@ -172,7 +161,6 @@ class GaussianVAE:
                  logdir,
                  encoder=None,
                  decoder=None,
-                 reg_fn=None,
                  postprocessor=None,
     ):
         self.input_dim = input_dim
@@ -180,7 +168,6 @@ class GaussianVAE:
         self.logdir = logdir
         self.encoder = encoder
         self.decoder = decoder
-        self.reg_fn = reg_fn if reg_fn is not None else lambda _: 0
         self.postprocessor = postprocessor if postprocessor is not None else lambda _: None
         if self.encoder is None:
             self.encoder = GaussianMLP(input_dim, latent_dim)
@@ -203,15 +190,11 @@ class GaussianVAE:
                 std = tf.exp(0.5 * logvar_latent)
             latent_code = mu_latent + epsilon * std
 
-        evidence = tf.reduce_sum(self.decoder.distribution(latent_code).log_prob(self.x), reduction_indices=1, name="evidence")
+        evidence = tf.reduce_sum(self.decoder.log_prob(self.x, latent_code), reduction_indices=1, name="evidence")
 
         with tf.name_scope("loss"):
             lower_bound = tf.reduce_mean(-kl_div + evidence, name="lower_bound")
-            loss = -lower_bound 
-            with tf.name_scope("regularized_loss"):
-                self.regularized_loss = loss \
-                    + self.encoder.regularization_loss(self.reg_fn) \
-                    + self.decoder.regularization_loss(self.reg_fn)
+            self.loss = -lower_bound 
 
         self.saver = tf.train.Saver()
 
@@ -226,14 +209,14 @@ class GaussianVAE:
               learning_rate=0.01,
               print_every=100,
     ):
-        train_step = tf.train.AdamOptimizer(learning_rate).minimize(self.regularized_loss)
+        train_step = tf.train.AdamOptimizer(learning_rate).minimize(self.loss)
         checkpoint_path = self.logdir + "/" + checkpoint
         with tf.Session() as sess:
             sess.run(tf.initialize_all_variables())
 
             for itr in range(1, n_itr+1):
                 batch, _ = train_data_queue.next_batch(batch_size)
-                _, curr_loss = sess.run([train_step, self.regularized_loss], feed_dict={self.x: batch})
+                _, curr_loss = sess.run([train_step, self.loss], feed_dict={self.x: batch})
 
                 if itr % print_every == 0:
                     self.saver.save(sess, checkpoint_path)
@@ -242,10 +225,10 @@ class GaussianVAE:
     def generate(self, checkpoint="model.ckpt", num_samples=1, use_logits=False):
         checkpoint_path = self.logdir + "/" + checkpoint
         epsilon = tf.random_normal([num_samples, self.latent_dim])
-        if use_logits:
+        if use_logits:  # Hack to reproduce MNIST results from VAE paper
             sample = self.decoder.distribution(epsilon).logits
         else:
-            sample = self.decoder.distribution(epsilon).sample()
+            sample = self.decoder.sample(epsilon)
 
         with tf.Session() as sess:
             self.saver.restore(sess, checkpoint_path)
